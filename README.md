@@ -1,4 +1,4 @@
-# Automated Headlight Control System for Vehicles
+# Adaptive Headlight System for Vehicles
 
 ## Purpose
 
