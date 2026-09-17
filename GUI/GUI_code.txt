@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""
+ADAS Sensor Diagnostic Tool - Streamlit Serial Edition
+Reads live STM32-style serial monitor data and renders the same dashboard UI.
+"""
+
+import re
+import time
+import random
+from datetime import datetime
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    serial = None
+
+MAX_DIST = 200
+SENSOR_ANGLES = [60, 20, -20, -60]
+SENSOR_LABELS = ["Far Left", "Front Left", "Front Right", "Far Right"]
+BEAM_WIDTH = 35
+DANGER_THRESHOLD = 15
+WARNING_THRESHOLD = 30
+TOP_VIEW_DIST_MAX = 60
+
+COLOR_DANGER = "#EF5350"
+COLOR_WARNING = "#FFA726"
+COLOR_SAFE = "#66BB6A"
+COLOR_CLEAR = "#90A4AE"
+COLOR_GRID = "#37474F"
+TOP_VIEW_MAX_R = 100
+
+DATA_RE = re.compile(
+    r"DIST:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)"
+    r"\s*\|\s*LDR:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)"
+    r"\s*\|\s*NORM:\s*(\d+)"
+)
+STATUS_RE = re.compile(r"S0:(.+?)\|\s*S1:(.+?)\|\s*S2:(.+?)\|\s*S3:(.+)")
+
+_STATIC_TRACE_COUNT = None
+
+
+def get_zone_color(distance, state):
+    if "OBS" in state or distance < DANGER_THRESHOLD:
+        return COLOR_DANGER
+    if "CAR" in state or distance < WARNING_THRESHOLD:
+        return COLOR_WARNING
+    if distance < 200:
+        return COLOR_SAFE
+    return COLOR_CLEAR
+
+
+def get_status_text(distance, state):
+    if distance >= 999:
+        return "CLEAR"
+    if "OBS" in state or distance < DANGER_THRESHOLD:
+        return "DANGER"
+    if "CAR" in state or distance < WARNING_THRESHOLD:
+        return "WARNING"
+    if distance < 200:
+        return "SAFE"
+    return "CLEAR"
+
+
+def has_car_detection(states):
+    return any("CAR" in s for s in states)
+
+
+def hex_to_rgba(hex_color, alpha):
+    hex_color = hex_color.lstrip("#")
+    red = int(hex_color[0:2], 16)
+    green = int(hex_color[2:4], 16)
+    blue = int(hex_color[4:6], 16)
+    return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+def _arc_points(radius, start_deg, end_deg, count=90):
+    theta = np.linspace(np.radians(start_deg), np.radians(end_deg), count)
+    return list(radius * np.cos(theta)), list(radius * np.sin(theta))
+
+
+def _top_view_radius(distance):
+    return TOP_VIEW_MAX_R * (min(distance, TOP_VIEW_DIST_MAX) / TOP_VIEW_DIST_MAX)
+
+
+def _build_static_annotations():
+    annotations = []
+    for dist in [DANGER_THRESHOLD, WARNING_THRESHOLD, 45, TOP_VIEW_DIST_MAX]:
+        r = _top_view_radius(dist)
+        annotations.append(
+            dict(x=0, y=r + 4, text=f"{dist}cm", showarrow=False, font=dict(color=COLOR_GRID, size=10))
+        )
+    return annotations
+
+
+def _build_top_view_figure():
+    fig = go.Figure()
+
+    zone_radii = [
+        (DANGER_THRESHOLD, COLOR_DANGER, 0.14),
+        (WARNING_THRESHOLD, COLOR_WARNING, 0.10),
+        (TOP_VIEW_DIST_MAX, COLOR_SAFE, 0.06),
+    ]
+    for dist, color, alpha in zone_radii:
+        r = _top_view_radius(dist)
+        x, y = _arc_points(r, 30, 150)
+        fig.add_trace(
+            go.Scatter(
+                x=[0] + x + [0],
+                y=[0] + y + [0],
+                mode="lines",
+                line=dict(color="rgba(0,0,0,0)", width=0),
+                fill="toself",
+                fillcolor=hex_to_rgba(color, alpha),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    for dist, color, width in [
+        (DANGER_THRESHOLD, COLOR_DANGER, 2),
+        (WARNING_THRESHOLD, COLOR_WARNING, 2),
+        (45, COLOR_GRID, 1),
+        (TOP_VIEW_DIST_MAX, COLOR_GRID, 1),
+    ]:
+        r = _top_view_radius(dist)
+        x, y = _arc_points(r, 30, 150)
+        fig.add_trace(
+            go.Scatter(x=x, y=y, mode="lines", line=dict(color=color, width=width), hoverinfo="skip", showlegend=False)
+        )
+
+    for angle in SENSOR_ANGLES:
+        center = 90 + angle
+        zx, zy = _arc_points(TOP_VIEW_MAX_R, center - BEAM_WIDTH / 2, center + BEAM_WIDTH / 2, count=50)
+        fig.add_trace(
+            go.Scatter(
+                x=zx,
+                y=zy,
+                mode="lines",
+                line=dict(color=COLOR_GRID, width=1, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[-8, 8, 8, -8, -8],
+            y=[-24, -24, 18, 18, -24],
+            fill="toself",
+            line=dict(color="#4F575F", width=2),
+            fillcolor="#7E8791",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=[-6, 6, 5, -5, -6],
+            y=[-16, -16, -6, -6, -16],
+            fill="toself",
+            line=dict(color="#4F575F", width=1),
+            fillcolor="#1E1E1E",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    fig.add_trace(go.Scatter(x=[-10, -8], y=[-10, -10], mode="lines", line=dict(color="#7E8791", width=5), showlegend=False))
+    fig.add_trace(go.Scatter(x=[8, 10], y=[-10, -10], mode="lines", line=dict(color="#7E8791", width=5), showlegend=False))
+
+    global _STATIC_TRACE_COUNT
+    _STATIC_TRACE_COUNT = len(fig.data)
+
+    for i in range(4):
+        fig.add_trace(
+            go.Scatter(
+                x=[],
+                y=[],
+                mode="lines",
+                name=SENSOR_LABELS[i],
+                line=dict(color=COLOR_CLEAR, width=1),
+                fill="toself",
+                fillcolor=hex_to_rgba(COLOR_CLEAR, 0.55),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        title="Top-Down Sensor View (Serial)",
+        xaxis=dict(showgrid=True, gridwidth=1, gridcolor=COLOR_GRID, zeroline=False, range=[-110, 110], fixedrange=True),
+        yaxis=dict(
+            showgrid=True,
+            gridwidth=1,
+            gridcolor=COLOR_GRID,
+            zeroline=False,
+            range=[-35, 110],
+            scaleanchor="x",
+            scaleratio=1,
+            fixedrange=True,
+        ),
+        plot_bgcolor="#1A1A1A",
+        paper_bgcolor="#1A1A1A",
+        font=dict(color="#E0E0E0", size=11),
+        height=500,
+        showlegend=False,
+        hovermode=False,
+        uirevision="top-view-static",
+        annotations=_build_static_annotations()
+        + [dict(x=0, y=0, text="", showarrow=False, font=dict(color="rgba(0,0,0,0)", size=12)) for _ in range(4)],
+    )
+
+    return fig
+
+
+def _update_top_view(fig, distances, states):
+    global _STATIC_TRACE_COUNT
+    static_count = _STATIC_TRACE_COUNT
+    if static_count is None:
+        static_count = max(len(fig.data) - 4, 0)
+        _STATIC_TRACE_COUNT = static_count
+
+    for i, angle in enumerate(SENSOR_ANGLES):
+        trace_idx = static_count + i
+        annot_idx = 4 + i
+        dist = distances[i]
+        center = 90 + angle
+
+        if dist >= 999:
+            fig.data[trace_idx].x = ()
+            fig.data[trace_idx].y = ()
+            fig.data[trace_idx].line.color = COLOR_CLEAR
+            fig.data[trace_idx].fillcolor = hex_to_rgba(COLOR_CLEAR, 0.20)
+            fig.layout.annotations[annot_idx].update(
+                x=TOP_VIEW_MAX_R * 0.78 * np.cos(np.radians(center)),
+                y=TOP_VIEW_MAX_R * 0.78 * np.sin(np.radians(center)),
+                text="CLEAR",
+                font=dict(color=COLOR_CLEAR, size=11, family="Arial"),
+            )
+            continue
+
+        color = get_zone_color(dist, states[i])
+        r = _top_view_radius(dist)
+        inner_r = max(r - 7, 0)
+        start = center - BEAM_WIDTH / 2
+        end = center + BEAM_WIDTH / 2
+        outer_x, outer_y = _arc_points(r, start, end, count=50)
+        inner_x, inner_y = _arc_points(inner_r, end, start, count=50)
+
+        fig.data[trace_idx].x = tuple(outer_x + inner_x)
+        fig.data[trace_idx].y = tuple(outer_y + inner_y)
+        fig.data[trace_idx].line.color = color
+        fig.data[trace_idx].fillcolor = hex_to_rgba(color, 0.55)
+
+        label = "CAR" if "CAR" in states[i] else "OBJ" if "OBS" in states[i] else "CLEAR"
+        label_r = max(r * 0.82, 8)
+        fig.layout.annotations[annot_idx].update(
+            x=label_r * np.cos(np.radians(center)),
+            y=label_r * np.sin(np.radians(center)),
+            text=label,
+            font=dict(color="#ECEFF1", size=12, family="Arial"),
+        )
+
+
+def get_top_view_chart(distances, states):
+    global _STATIC_TRACE_COUNT
+    if "top_view_fig" not in st.session_state:
+        st.session_state.top_view_fig = _build_top_view_figure()
+    elif _STATIC_TRACE_COUNT is None:
+        _STATIC_TRACE_COUNT = max(len(st.session_state.top_view_fig.data) - 4, 0)
+
+    fig = st.session_state.top_view_fig
+    _update_top_view(fig, distances, states)
+    return fig
+
+
+def get_distance_chart(distances):
+    colors = [get_zone_color(distances[i], "") for i in range(4)]
+    labels = [f"{d}cm" for d in distances]
+
+    if "dist_chart_fig" not in st.session_state:
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=SENSOR_LABELS,
+                    y=distances,
+                    marker=dict(color=colors),
+                    text=labels,
+                    textposition="auto",
+                    hovertemplate="<b>%{x}</b><br>Distance: %{y} cm<extra></extra>",
+                )
+            ]
+        )
+        fig.add_hrect(y0=0, y1=DANGER_THRESHOLD, fillcolor=hex_to_rgba(COLOR_DANGER, 0.12), line_width=0)
+        fig.add_hrect(y0=DANGER_THRESHOLD, y1=WARNING_THRESHOLD, fillcolor=hex_to_rgba(COLOR_WARNING, 0.10), line_width=0)
+        fig.add_hline(
+            y=DANGER_THRESHOLD,
+            line_dash="dash",
+            line_color=COLOR_DANGER,
+            annotation_text=f"Danger < {DANGER_THRESHOLD} cm",
+        )
+        fig.add_hline(
+            y=WARNING_THRESHOLD,
+            line_dash="dash",
+            line_color=COLOR_WARNING,
+            annotation_text=f"Warning < {WARNING_THRESHOLD} cm",
+        )
+        fig.update_layout(
+            title="Sensor Distance Measurements",
+            xaxis_title="Sensor",
+            yaxis_title="Distance (cm)",
+            plot_bgcolor="#1A1A1A",
+            paper_bgcolor="#1A1A1A",
+            font=dict(color="#E0E0E0"),
+            height=350,
+            showlegend=False,
+            yaxis=dict(range=[0, 220]),
+            uirevision="constant",
+        )
+        st.session_state.dist_chart_fig = fig
+    else:
+        fig = st.session_state.dist_chart_fig
+        fig.data[0].y = distances
+        fig.data[0].marker.color = colors
+        fig.data[0].text = labels
+
+    return fig
+
+
+def create_sensor_status_table(distances, states, ldrs):
+    return pd.DataFrame(
+        {
+            "Sensor": SENSOR_LABELS,
+            "Channel": ["CH0", "CH1", "CH2", "CH3"],
+            "Distance": [f"{d} cm" for d in distances],
+            "Status": states,
+            "Ambient LDR": ldrs,
+        }
+    )
+
+
+def init_stream_state():
+    if "demo_running" not in st.session_state:
+        st.session_state.demo_running = True
+    if "update_interval" not in st.session_state:
+        st.session_state.update_interval = 0.25
+    if "pause_updates" not in st.session_state:
+        st.session_state.pause_updates = False
+    if "ser" not in st.session_state:
+        st.session_state.ser = None
+    if "ser_port" not in st.session_state:
+        st.session_state.ser_port = ""
+    if "serial_data" not in st.session_state:
+        st.session_state.serial_data = {
+            "distances": [999, 999, 999, 999],
+            "states": ["CLEAR", "CLEAR", "CLEAR", "CLEAR"],
+            "ldrs": [0, 0, 0, 0],
+            "norm": 0,
+            "last_line": "Waiting for serial data...",
+        }
+
+
+def available_ports():
+    if serial is None:
+        return []
+    return [p.device for p in serial.tools.list_ports.comports()]
+
+
+def connect_serial(port, baud):
+    if serial is None or not port:
+        return False, "pyserial not available or no port selected"
+
+    try:
+        if st.session_state.ser and st.session_state.ser.is_open:
+            st.session_state.ser.close()
+        st.session_state.ser = serial.Serial(port, baud, timeout=0.03)
+        st.session_state.ser_port = port
+        return True, f"Connected to {port}"
+    except Exception as exc:
+        st.session_state.ser = None
+        return False, f"Connection failed: {exc}"
+
+
+def disconnect_serial():
+    try:
+        if st.session_state.ser and st.session_state.ser.is_open:
+            st.session_state.ser.close()
+    except Exception:
+        pass
+    st.session_state.ser = None
+    st.session_state.ser_port = ""
+
+
+def read_serial_data_once(use_mock_fallback=False):
+    data = st.session_state.serial_data
+    ser = st.session_state.ser
+
+    got_data = False
+    if ser and getattr(ser, "is_open", False):
+        try:
+            loops = 0
+            while ser.in_waiting and loops < 80:
+                loops += 1
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                got_data = True
+                data["last_line"] = line
+
+                d_match = DATA_RE.match(line)
+                if d_match:
+                    data["distances"] = [int(d_match.group(i)) for i in range(1, 5)]
+                    data["ldrs"] = [int(d_match.group(i)) for i in range(5, 9)]
+                    data["norm"] = int(d_match.group(9))
+                    continue
+
+                s_match = STATUS_RE.search(line)
+                if s_match:
+                    data["states"] = [s_match.group(i).strip() for i in range(1, 5)]
+        except Exception as exc:
+            data["last_line"] = f"Serial read error: {exc}"
+
+    if not got_data and use_mock_fallback:
+        data["distances"] = [random.randint(60, 200) for _ in range(4)]
+        data["states"] = [random.choice(["DAY (CLEAR)", "DAY (CAR)", "OBS (DANGER)"]) for _ in range(4)]
+        data["ldrs"] = [random.randint(100, 300) for _ in range(4)]
+        data["norm"] = random.randint(200, 350)
+        data["last_line"] = "No serial frame; showing mock fallback"
+
+    st.session_state.serial_data = data
+    return data
+
+
+def main():
+    st.set_page_config(page_title="ADAS Serial Monitor", layout="wide", initial_sidebar_state="expanded", menu_items=None)
+
+    st.markdown(
+        """
+    <style>
+    .main { background-color: #0F1419; }
+    .stMetric { background-color: #1A1F2E; padding: 12px; border-radius: 8px; border-left: 4px solid #1976D2; }
+    .sensor-card { background: linear-gradient(135deg, #1A1F2E 0%, #252D3D 100%); border-radius: 10px; padding: 18px; margin-bottom: 12px; border-left: 5px solid #1976D2; }
+    .vehicle-pill { display:inline-block; padding:8px 14px; border-radius:999px; font-size:12px; font-weight:700; margin:4px 0 10px 0; }
+    .vehicle-pill.detected { background: rgba(255,167,38,0.18); color:#FFB74D; border:1px solid rgba(255,167,38,0.35); }
+    .vehicle-pill.clear { background: rgba(102,187,106,0.15); color:#81C784; border:1px solid rgba(102,187,106,0.30); }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    init_stream_state()
+
+    st.markdown("# ADAS Sensor Diagnostic Tool (Serial)")
+    st.markdown("#### Real-time Ultrasonic / Radar from Serial Monitor")
+
+    with st.sidebar:
+        st.markdown("### Serial Connection")
+
+        ports = available_ports()
+        if serial is None:
+            st.error("pyserial not installed. Run: pip install pyserial")
+
+        port = st.selectbox("Port", options=ports if ports else [""], index=0, help="Select STM32 serial port")
+        baud = st.selectbox("Baud", options=[9600, 57600, 115200, 230400], index=2)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Connect", use_container_width=True):
+                ok, msg = connect_serial(port, baud)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+        with c2:
+            if st.button("Disconnect", use_container_width=True):
+                disconnect_serial()
+                st.info("Disconnected")
+
+        use_mock = st.checkbox("Mock fallback if no serial", value=False)
+        st.session_state.update_interval = st.slider("Refresh (s)", 0.1, 1.5, 0.25, step=0.05)
+        st.toggle(
+            "Pause live refresh",
+            key="pause_updates",
+            help="Freeze the charts so Plotly fullscreen stays open while you inspect the graph.",
+        )
+
+        status = "Connected" if (st.session_state.ser and st.session_state.ser.is_open) else "Disconnected"
+        st.markdown(f"**Status**: {status}")
+        st.markdown(f"**Port**: {st.session_state.ser_port or '-'}")
+        st.markdown(f"**Last Update**: {datetime.now().strftime('%H:%M:%S')}")
+        st.markdown(f"**Refresh Mode**: {'Paused' if st.session_state.pause_updates else 'Live'}")
+
+    def render_live_view(read_live=True):
+        frame = read_serial_data_once(use_mock_fallback=use_mock) if read_live else st.session_state.serial_data
+        distances = frame["distances"]
+        states = frame["states"]
+        ldrs = frame["ldrs"]
+        norm = frame["norm"]
+        car_present = has_car_detection(states)
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Front Left", f"{distances[1]} cm", delta=get_status_text(distances[1], states[1]), delta_color="off")
+        with col2:
+            st.metric("Front Right", f"{distances[2]} cm", delta=get_status_text(distances[2], states[2]), delta_color="off")
+        with col3:
+            st.metric("Front Avg", f"{(distances[1] + distances[2]) / 2:.0f} cm")
+        with col4:
+            st.metric("Ambient (NORM)", f"{norm}")
+
+        st.metric(
+            "Vehicle Presence",
+            "DETECTED" if car_present else "CLEAR",
+            delta="CAR in lane" if car_present else "No CAR state",
+            delta_color="off",
+        )
+
+        st.markdown(
+            f'<div class="vehicle-pill {"detected" if car_present else "clear"}">'
+            f'{"CAR DETECTED" if car_present else "NO CAR DETECTED"}</div>',
+            unsafe_allow_html=True,
+        )
+
+        tab1, tab2, tab3 = st.tabs(["Top-Down View", "Distance Chart", "Raw Data"])
+
+        with tab1:
+            if st.session_state.pause_updates:
+                st.caption("Live refresh is paused, so fullscreen will stay open until you resume updates.")
+            st.plotly_chart(get_top_view_chart(distances, states), use_container_width=True, key="top_view_plot")
+
+        with tab2:
+            st.plotly_chart(get_distance_chart(distances), use_container_width=True, key="dist_chart_plot")
+
+        with tab3:
+            st.code(frame["last_line"])
+            df = create_sensor_status_table(distances, states, ldrs)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if hasattr(st, "fragment") and not st.session_state.pause_updates:
+        @st.fragment(run_every=f"{int(st.session_state.update_interval * 1000)}ms")
+        def live_fragment():
+            render_live_view(read_live=True)
+
+        live_fragment()
+    else:
+        render_live_view(read_live=not st.session_state.pause_updates)
+        if not hasattr(st, "fragment") and not st.session_state.pause_updates:
+            time.sleep(st.session_state.update_interval)
+            st.rerun()
+
+
+if __name__ == "__main__":
+    main()
